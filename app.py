@@ -161,5 +161,17 @@ async def serve(port: int) -> None:
         await server.serve_forever()
 
 
+def main(
+    argv: Sequence[str] | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> None:
+    """Run the server, exiting cleanly when interrupted by the user."""
+    port = resolve_port(argv, environ)
+    try:
+        asyncio.run(serve(port))
+    except KeyboardInterrupt:
+        pass
+
+
 if __name__ == "__main__":
-    asyncio.run(serve(resolve_port()))
+    main()

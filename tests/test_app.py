@@ -6,9 +6,24 @@ import asyncio
 import functools
 import io
 import unittest
+from collections.abc import Coroutine
 from contextlib import redirect_stderr
+from typing import Never
+from unittest.mock import patch
 
-from app import DEFAULT_PORT, handle_client, resolve_port
+from app import DEFAULT_PORT, handle_client, main, resolve_port
+
+
+class MainTests(unittest.TestCase):
+    def test_keyboard_interrupt_from_asyncio_runner_is_suppressed(self) -> None:
+        def interrupt(coroutine: Coroutine[object, object, None]) -> Never:
+            coroutine.close()
+            raise KeyboardInterrupt
+
+        with patch("app.asyncio.run", side_effect=interrupt) as run:
+            main(["--port", "9000"], {})
+
+        run.assert_called_once()
 
 
 class PortResolutionTests(unittest.TestCase):

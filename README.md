@@ -8,8 +8,17 @@ response is plain text, not JSON. Header order, duplicate names, casing, whitesp
 Run the service with Python 3.11 or newer:
 
 ```sh
-PORT=8080 python3 app.py
+python3 app.py --port 8080
 ```
+
+When using uv locally, the equivalent command is:
+
+```sh
+uv run python app.py --port 8080
+```
+
+The optional `--port` argument takes precedence over `PORT`, and the service defaults to port 8080 when neither is
+set. `PORT` remains supported so Railway can provide the listening port automatically.
 
 Send duplicate headers with curl:
 
@@ -26,9 +35,14 @@ printf 'GET / HTTP/1.1\r\nHost: localhost\r\nx-Mixed:\t value  \r\nX-Repeat: 1\r
 
 ## Railway deployment
 
-Create a Railway service from this repository. Railway detects the `Dockerfile`, builds it, and supplies `PORT` at
-runtime. Generate a public domain in the service networking settings. No packages or start-command override are
-needed.
+Create a Railway service from this repository and use Railpack as the builder. Railpack detects uv from
+`pyproject.toml` and `uv.lock`, then installs the locked environment with `uv sync --locked`. The project is configured
+as a non-package application because there is no Python package to install. Railpack selects its supported uv tooling;
+it does not necessarily use the uv version that generated the lock file locally or the globally latest release.
+
+The `railpack.json` file keeps the start command as `python3 app.py`. Railpack places the uv-created virtual
+environment on `PATH`, so invoking uv at runtime is unnecessary. Railway supplies `PORT`. Generate a public domain in
+the service networking settings; no start-command override is needed.
 
 Compare Railway directly with a hostname proxied by Cloudflare:
 
@@ -59,6 +73,6 @@ High-level HTTP servers parse headers into mappings or normalized field objects,
 fields, original casing, whitespace, and wire line endings. Reading the request head directly with
 `asyncio.start_server` preserves the byte slice that reaches the process while still enforcing strict size and time
 limits. This makes direct and proxied requests easier to compare without pretending to observe bytes changed upstream.
-# header_tester
-# header_tester
-# header_tester
+
+The locked, dependency-free uv environment gives Railpack a reproducible build while the minimal configuration keeps
+the process entry point explicit and reviewable.

@@ -1,0 +1,4 @@
+.opencode/
+.venv/
+__pycache__/
+*.py[cod]

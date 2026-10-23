@@ -1,0 +1,7 @@
+.git/
+.gitignore
+.opencode/
+.venv/
+__pycache__/
+*.py[cod]
+tests/

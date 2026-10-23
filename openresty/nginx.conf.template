@@ -1,0 +1,29 @@
+worker_processes auto;
+daemon off;
+pid nginx.pid;
+
+error_log stderr notice;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    access_log /dev/stdout combined;
+
+    client_header_timeout 5s;
+    client_header_buffer_size 1k;
+    large_client_header_buffers 1 16k;
+    client_max_body_size 0;
+    keepalive_timeout 0;
+    keepalive_requests 1;
+
+    server {
+        listen {{PORT}};
+        server_name _;
+
+        location / {
+            content_by_lua_file /app/openresty/raw_headers.lua;
+        }
+    }
+}

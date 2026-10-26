@@ -70,6 +70,58 @@ Cloudflare, Railway's edge, and other proxies may normalize, combine, remove, ad
 request reaches this process. The service can report only the bytes delivered to its TCP socket, not the original
 client-to-edge bytes. Railway's public URL may also traverse infrastructure that changes the request.
 
+## Native TLS on a public VPS (Python only)
+
+The Python runtime can terminate TLS directly: `Cloudflare -> HTTPS -> Python`, without an intermediate HTTP proxy.
+Run on an unprivileged port with an externally provisioned PEM certificate chain and matching unencrypted private key:
+
+```sh
+python3 app.py --port 8443 --tls-cert /etc/header-tester/certs/fullchain.pem \
+  --tls-key /etc/header-tester/certs/private-key.pem
+```
+
+Alternatively, set `TLS_CERT_FILE` and `TLS_KEY_FILE`. Each CLI option overrides its corresponding environment value.
+Both files must be configured together and non-empty; unreadable, invalid, or mismatched files fail safely at startup.
+Encrypted private keys are unsupported and never trigger a password prompt. Files are loaded before the event loop
+starts; restart the process after certificate renewal. No certificate or private key should be committed or baked into
+the image.
+
+The existing default container entry point reads these environment variables without a start-command override:
+
+```sh
+docker run --rm -p 443:8443 -e PORT=8443 -e HEADER_SERVER=python \
+  -e TLS_CERT_FILE=/certs/fullchain.pem -e TLS_KEY_FILE=/certs/private-key.pem \
+  --mount type=bind,src=/etc/header-tester/certs,dst=/certs,readonly raw-header-tester
+```
+
+The certificate directory must already exist on the host. The read-only mount keeps credentials outside the image;
+restrict host file permissions appropriately. This maps public host port 443 to container port 8443. For direct Python
+execution, arrange an equivalent host-level port mapping if Cloudflare connects on 443. The process opens one listener:
+HTTP **or** HTTPS, not both. TLS does not change the default port: it remains 8080 unless `--port` or `PORT` is
+configured.
+Without TLS settings, plain HTTP and Railway defaults remain unchanged. OpenResty mode does not implement native TLS
+here and rejects either TLS environment variable, including empty values, rather than silently ignoring it.
+
+For Cloudflare deployment:
+
+1. Create a proxied (orange-cloud) DNS `A` record for the hostname pointing to the VPS public IPv4 address.
+2. Install a certificate valid for that hostname: either a Cloudflare Origin CA certificate or a publicly trusted
+   certificate with its required chain. Keep the matching private key on the VPS.
+3. Use Cloudflare **Full (strict)** encryption for this hostname. Do not downgrade the global SSL mode to bypass
+   certificate failures. Origin CA certificates are trusted by Cloudflare, not ordinary browsers or default clients;
+   direct verification requires explicitly trusting the Origin CA root. Publicly trusted certificates allow normal
+   direct-client verification.
+4. Configure the Cloudflare-to-origin connection to use HTTP/1.1 only (disable HTTP/2 to Origin if enabled). The Python
+   TLS listener advertises only `http/1.1` via ALPN, requires TLS 1.2 or newer, and does not implement HTTP/2 or HTTP/3.
+5. Restrict inbound origin HTTPS access to Cloudflare's published IP ranges in the VPS firewall, including IPv6 if
+   applicable; keep those ranges current and retain separately controlled administrative access. Account for Docker's
+   published-port firewall rules so the container mapping does not bypass the restriction.
+
+TLS preserves the raw **decrypted HTTP/1.x header bytes received from Cloudflare**, not TLS ciphertext or the original
+client-to-Cloudflare bytes. Cloudflare can still transform headers before forwarding them. This is a diagnostic echo
+endpoint: never send sensitive request data, authentication headers, cookies, or personal information to it.
+TLS handshake and shutdown each have a five-second timeout, separate from the existing request-header timeout.
+
 ## Runtime parity and limits
 
 The Python server accepts one HTTP/1.0 or HTTP/1.1 request per connection. It allows at most 16 KiB through the
@@ -108,6 +160,12 @@ High-level HTTP servers parse headers into mappings or normalized field objects,
 fields, original casing, whitespace, and wire line endings. Reading the request head directly with
 `asyncio.start_server` preserves the byte slice that reaches the process while still enforcing strict size and time
 limits. This makes direct and proxied requests easier to compare without pretending to observe bytes changed upstream.
+
+Optional native TLS removes a header-rewriting HTTP proxy from the VPS origin path while leaving the raw byte-slicing
+logic unchanged. Synchronous credential loading makes invalid TLS configuration fail before accepting connections;
+bounded asynchronous handshakes and shutdowns limit stalled TLS connections. Explicit Python-only validation avoids
+accidentally exposing plain HTTP when TLS was requested in OpenResty mode. Keeping TLS opt-in preserves deployments
+that already terminate HTTPS at Railway or another edge.
 
 Docker is now used because Railpack does not natively provision the official OpenResty runtime. One pinned Bookworm
 image can contain OpenResty and the dependency-free Python implementation, while a small validated entry point selects

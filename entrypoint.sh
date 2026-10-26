@@ -38,6 +38,10 @@ case "$selector" in
         exec python3 app.py
         ;;
     openresty)
+        if [ "${TLS_CERT_FILE+x}" = x ] || [ "${TLS_KEY_FILE+x}" = x ]; then
+            printf '%s\n' 'TLS_CERT_FILE and TLS_KEY_FILE are supported only with HEADER_SERVER=python' >&2
+            exit 2
+        fi
         script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
         template="$script_dir/openresty/nginx.conf.template"
         runtime_parent=${HEADER_SERVER_RUNTIME_PARENT-/tmp}

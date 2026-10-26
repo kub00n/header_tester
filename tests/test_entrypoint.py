@@ -23,6 +23,7 @@ class EntrypointTests(unittest.TestCase):
         selector: str | None = None,
         port: str | None = None,
         stub: str = "python3",
+        tls: dict[str, str] | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], str | None]:
         with tempfile.TemporaryDirectory() as temporary_directory:
             stub_path = Path(temporary_directory) / stub
@@ -35,6 +36,9 @@ class EntrypointTests(unittest.TestCase):
             stub_path.chmod(stub_path.stat().st_mode | stat.S_IXUSR)
 
             environment = os.environ.copy()
+            environment.pop("TLS_CERT_FILE", None)
+            environment.pop("TLS_KEY_FILE", None)
+            environment.update(tls or {})
             environment["PATH"] = f"{temporary_directory}:{environment['PATH']}"
             environment["HEADER_SERVER_RUNTIME_PARENT"] = temporary_directory
             if selector is None:
@@ -76,6 +80,22 @@ class EntrypointTests(unittest.TestCase):
         self.assertIsNotNone(config)
         self.assertIn("listen 8080;", config)
         self.assertNotIn("{{PORT}}", config)
+
+    def test_python_mode_passes_tls_environment_to_app(self) -> None:
+        result, _ = self._run(tls={"TLS_CERT_FILE": "/unused/cert", "TLS_KEY_FILE": "/unused/key"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "stub=python3\nargs=app.py\n")
+
+    def test_openresty_rejects_any_tls_environment_configuration(self) -> None:
+        for tls in ({"TLS_CERT_FILE": "/unused/cert"}, {"TLS_KEY_FILE": ""}):
+            with self.subTest(tls=tls):
+                result, _ = self._run(selector="openresty", stub="openresty", tls=tls)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(
+                    result.stderr,
+                    "TLS_CERT_FILE and TLS_KEY_FILE are supported only with HEADER_SERVER=python\n",
+                )
 
     def test_rejects_invalid_selector(self) -> None:
         for selector in ("", "gunicorn", "Python"):

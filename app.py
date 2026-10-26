@@ -6,11 +6,13 @@ import argparse
 import asyncio
 import os
 import re
+import ssl
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 
 DEFAULT_PORT = 8080
 HEADER_TIMEOUT_SECONDS = 5.0
+TLS_TIMEOUT_SECONDS = 5.0
 MAX_REQUEST_HEAD_SIZE = 16 * 1024
 
 _REQUEST_LINE = re.compile(rb"[^\x00-\x20\x7f]+ [^\x00-\x20\x7f]+ HTTP/1\.[01]")
@@ -32,18 +34,23 @@ def _cli_port(value: str) -> int:
     return port
 
 
-def resolve_port(
+def resolve_configuration(
     argv: Sequence[str] | None = None,
     environ: Mapping[str, str] | None = None,
-) -> int:
-    """Resolve and validate the listening port from CLI arguments and the environment."""
+) -> tuple[int, str | None, str | None]:
+    """Resolve CLI options with per-option environment fallback and validate TLS pairing."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", metavar="PORT", type=_cli_port, help="TCP port to listen on")
+    parser.add_argument("--tls-cert", metavar="FILE", help="PEM certificate chain (or TLS_CERT_FILE)")
+    parser.add_argument("--tls-key", metavar="FILE", help="PEM private key (or TLS_KEY_FILE)")
     arguments = parser.parse_args(argv)
-    if arguments.port is not None:
-        return arguments.port
+    environment = os.environ if environ is None else environ
+    cert = arguments.tls_cert if arguments.tls_cert is not None else environment.get("TLS_CERT_FILE")
+    key = arguments.tls_key if arguments.tls_key is not None else environment.get("TLS_KEY_FILE")
+    if (cert is not None or key is not None) and (not cert or not key):
+        raise SystemExit("TLS requires both --tls-cert/TLS_CERT_FILE and --tls-key/TLS_KEY_FILE to be non-empty")
 
-    port_text = (os.environ if environ is None else environ).get("PORT", str(DEFAULT_PORT))
+    port_text = environment.get("PORT", str(DEFAULT_PORT)) if arguments.port is None else arguments.port
     try:
         port = int(port_text)
     except ValueError as error:
@@ -51,7 +58,38 @@ def resolve_port(
 
     if not 1 <= port <= 65535:
         raise SystemExit("PORT must be between 1 and 65535")
-    return port
+    return port, cert, key
+
+
+def resolve_port(
+    argv: Sequence[str] | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> int:
+    """Resolve and validate the listening port from CLI arguments and the environment."""
+    return resolve_configuration(argv, environ)[0]
+
+
+def create_tls_context(cert: str | None, key: str | None) -> ssl.SSLContext | None:
+    """Load optional server credentials synchronously, reporting only safe configuration errors."""
+    if cert is None and key is None:
+        return None
+    if not cert or not key:
+        raise SystemExit("TLS requires both a non-empty certificate file and private key file")
+
+    def reject_password() -> str:
+        # Never let OpenSSL prompt on stdin during unattended startup.
+        raise ValueError("Encrypted private keys are not supported")
+
+    try:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.set_alpn_protocols(["http/1.1"])
+        context.load_cert_chain(cert, key, password=reject_password)
+    except (OSError, ValueError):
+        raise SystemExit(
+            "TLS setup failed: check certificate/key readability, valid PEM, matching key, and an unencrypted key"
+        ) from None
+    return context
 
 
 class IncompleteRequestError(Exception):
@@ -145,17 +183,27 @@ async def handle_client(
 
         writer.write(response)
         await writer.drain()
-    except (BrokenPipeError, ConnectionResetError):
+    except (ConnectionError, ssl.SSLError):
         pass
     finally:
         writer.close()
-        with suppress(BrokenPipeError, ConnectionResetError):
+        with suppress(ConnectionError, ssl.SSLError, asyncio.TimeoutError):
             await writer.wait_closed()
 
 
-async def serve(port: int) -> None:
-    """Run the raw-header HTTP server until it is stopped."""
-    server = await asyncio.start_server(handle_client, "0.0.0.0", port)
+async def serve(port: int, tls_context: ssl.SSLContext | None = None) -> None:
+    """Run one HTTP or HTTPS listener until it is stopped."""
+    if tls_context is None:
+        server = await asyncio.start_server(handle_client, "0.0.0.0", port)
+    else:
+        server = await asyncio.start_server(
+            handle_client,
+            "0.0.0.0",
+            port,
+            ssl=tls_context,
+            ssl_handshake_timeout=TLS_TIMEOUT_SECONDS,
+            ssl_shutdown_timeout=TLS_TIMEOUT_SECONDS,
+        )
     print(f"Listening on 0.0.0.0:{port}", flush=True)
     async with server:
         await server.serve_forever()
@@ -166,11 +214,14 @@ def main(
     environ: Mapping[str, str] | None = None,
 ) -> None:
     """Run the server, exiting cleanly when interrupted by the user."""
-    port = resolve_port(argv, environ)
+    port, cert, key = resolve_configuration(argv, environ)
+    tls_context = create_tls_context(cert, key)
     try:
-        asyncio.run(serve(port))
+        asyncio.run(serve(port, tls_context))
     except KeyboardInterrupt:
         pass
+    except OSError:
+        raise SystemExit("Server startup or transport failed: check listening address and port availability") from None
 
 
 if __name__ == "__main__":

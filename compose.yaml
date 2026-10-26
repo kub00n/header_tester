@@ -1,0 +1,35 @@
+services:
+  http:
+    build: .
+    environment:
+      HEADER_SERVER: python
+      PORT: "8080"
+    ports:
+      - "80:8080"
+    restart: unless-stopped
+
+  https:
+    build: .
+    environment:
+      HEADER_SERVER: python
+      PORT: "8443"
+      TLS_CERT_FILE: /certs/fullchain.pem
+      TLS_KEY_FILE: /certs/private-key.pem
+    ports:
+      - "443:8443"
+    volumes:
+      - type: bind
+        source: "${HOST_TLS_CERT_FILE:-./certificates/fullchain.pem}"
+        target: /certs/fullchain.pem
+        read_only: true
+        bind:
+          create_host_path: false
+          selinux: Z
+      - type: bind
+        source: "${HOST_TLS_KEY_FILE:-./certificates/private-key.pem}"
+        target: /certs/private-key.pem
+        read_only: true
+        bind:
+          create_host_path: false
+          selinux: Z
+    restart: unless-stopped

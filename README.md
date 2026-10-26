@@ -70,6 +70,120 @@ Cloudflare, Railway's edge, and other proxies may normalize, combine, remove, ad
 request reaches this process. The service can report only the bytes delivered to its TCP socket, not the original
 client-to-edge bytes. Railway's public URL may also traverse infrastructure that changes the request.
 
+## Docker Compose: HTTP and HTTPS on a VPS
+
+Prerequisites: Docker Engine and a current Docker Compose plugin on the VPS, available host ports 80 and 443, and
+a checkout containing the new commits that add `compose.yaml` and these deployment instructions. The existing image
+includes Python 3.11; no host Python 3.11 installation is needed. Initial builds require network access to obtain the
+base image and its OS packages.
+
+### Self-signed diagnostic certificate
+
+For a direct diagnostic test, use the installed OpenSSL CLI (1.1.1 or newer) on the VPS. From the repository root:
+
+```sh
+./scripts/generate-test-cert.sh headers.example.com
+docker compose up -d --build
+docker compose logs --tail=100 http https
+```
+
+The script accepts exactly one DNS hostname (ASCII letters, digits, hyphens, dots; at most 64 characters, labels at
+most 63 characters, no leading/trailing label hyphens). It generates a matching RSA private key and a seven-day
+self-signed **TEST** certificate with that hostname as the CN and DNS SAN. There is no automatic startup generation.
+`certificates/private-key.pem` and `certificates/fullchain.pem` are untracked.
+The entire `certificates/` directory is ignored by Git and Docker.
+Unset any previously exported `HOST_TLS_CERT_FILE` and `HOST_TLS_KEY_FILE` to use these defaults.
+
+Generation uses umask `077`, creates new directories with mode `700`, and produces files accessible only to the owner.
+The script atomically reserves `certificates/` and refuses any existing path there, even an empty directory, symlink, or
+partial previous output. It never overwrites files, prints key material, or deletes partial output on failure.
+Have the operator review failed output separately; rerunning does not replace or repair it. Run in an owner-controlled
+checkout, not a directory writable by untrusted users. Existing directory permissions are not changed.
+
+For direct verification, use the matching hostname, bypassing Cloudflare with a local address if testing on the VPS:
+
+```sh
+curl --http1.1 --cacert certificates/fullchain.pem \
+  --resolve headers.example.com:443:127.0.0.1 https://headers.example.com/
+```
+
+`curl -k` is an alternative **only for a local diagnostic test**; it disables certificate verification.
+This self-signed certificate is **not Cloudflare Origin CA** and is **not compatible with Cloudflare Full (strict)**.
+For Full (strict), provision a valid Cloudflare Origin CA or publicly trusted certificate separately as described below.
+Never downgrade the global Cloudflare encryption mode to accommodate a test certificate.
+
+### Cloudflare Origin CA or publicly trusted certificate
+
+For a Cloudflare-proxied hostname, open the zone in the Cloudflare dashboard and go to
+**SSL/TLS -> Origin Server -> Create Certificate**. Choose to generate a private key and CSR with Cloudflare,
+include the intended hostname, choose validity, and create the certificate in PEM format. Save the displayed private
+key securely before leaving the screen; it cannot be viewed again afterward.
+
+For a fresh checkout without `certificates/`, manually create the dedicated directory with restrictive permissions:
+
+```sh
+umask 077
+mkdir -m 700 certificates
+```
+
+Manually save the Origin Certificate as `certificates/fullchain.pem` and its matching private key as
+`certificates/private-key.pem`, with file permissions `600`. Keep both outside Git; the directory is also excluded
+from the Docker build context. Do not overwrite any existing credentials or run the self-signed generator on this
+already provisioned directory. With external overrides unset, run `docker compose up -d --build`, then configure
+Cloudflare **Full (strict)**. Origin CA certificates are trusted by Cloudflare, not ordinary direct browsers.
+
+For direct-browser trust, use a publicly trusted certificate such as **Let's Encrypt via DNS-01** instead. Provision
+and renew it separately, including the required certificate chain, using either these dedicated files or external
+overrides below. Never downgrade global Cloudflare TLS mode to bypass certificate validation.
+
+### Externally provisioned certificate
+
+Keep externally provisioned certificates and matching unencrypted keys outside the repository and build context.
+Use absolute paths to existing, dedicated files on the Docker host, not directories. Override both default paths:
+
+```sh
+export HOST_TLS_CERT_FILE=/etc/header-tester/certs/fullchain.pem
+export HOST_TLS_KEY_FILE=/etc/header-tester/certs/private-key.pem
+docker compose up -d --build
+docker compose logs --tail=100 http https
+```
+
+Unset or empty path variables fall back to `./certificates/fullchain.pem` and `./certificates/private-key.pem`.
+The relative defaults resolve from the Compose project directory, not the invoking shell's current directory.
+Missing host paths fail at container creation instead of being created as directories. Files are mounted read-only at
+`/certs/fullchain.pem` and `/certs/private-key.pem` in the HTTPS container only. No credential contents are placed in
+Compose or the image. `.dockerignore` excludes common environment and certificate/key artifacts as defense in depth;
+the Dockerfile still copies only explicit application sources. Do not place credentials among those sources.
+
+On AlmaLinux 8 with SELinux enforcing, the mounts use private `Z` relabeling. Use dedicated certificate/key files for
+this HTTPS container: relabeling changes their host labels and can disrupt other services that share those files.
+Do not point these mounts at shared system certificate files or directories. Have the host administrator provision
+dedicated files with suitable permissions and labels; keep SELinux enforcing.
+
+The `http` service publishes host **80 -> 8080** and the `https` service publishes **443 -> 8443**. Both explicitly
+select Python through the existing image entry point; OpenResty is not started and there is no intermediate HTTP proxy.
+HTTP receives no TLS variables or mounts, even if TLS variables are exported in the invoking shell. Both services
+restart unless stopped. Railway and the standalone runtime selector remain unchanged.
+
+Inspect `http://headers.example.com/` (port 80) and `https://headers.example.com/` (port 443), replacing the hostname
+with yours. There is **no automatic HTTP-to-HTTPS redirect**: both listeners echo headers for inspection. Cloudflare
+edge redirects, if enabled separately, may prevent HTTP requests from reaching the HTTP listener.
+
+Apply the Cloudflare **Full (strict)**, HTTP/1.1 origin, and certificate-trust guidance below. Configure firewall access
+for both published ports, including IPv6 where applicable. Docker's published-port rules can bypass ordinary host
+firewall rules; enforce origin restrictions in rules that actually cover Docker traffic. For Cloudflare-only access,
+allow Cloudflare's current published IP ranges on both 80 and 443 and retain separate administrative access.
+
+After certificate renewal, recreate HTTPS so file bind mounts pick up files replaced atomically, and Python reloads TLS:
+
+```sh
+docker compose up -d --force-recreate https
+docker compose logs --tail=100 https
+```
+
+Keep the exported paths available for subsequent Compose commands. The diagnostic endpoint must not receive sensitive
+headers or personal data, especially over unencrypted HTTP.
+
 ## Native TLS on a public VPS (Python only)
 
 The Python runtime can terminate TLS directly: `Cloudflare -> HTTPS -> Python`, without an intermediate HTTP proxy.
@@ -155,6 +269,11 @@ python3 -m unittest discover -v
 ```
 
 ## Reasoning
+
+Compose uses two Python processes because each opens only one listener. Reusing the existing image and entry point
+adds simultaneous HTTP/HTTPS without a header-rewriting proxy or changes to Railway. Ignored local test credentials
+make diagnostics reproducible; external overrides retain production certificate provisioning. Exclusive directory
+creation prevents accidental replacement, while read-only mounts and build exclusions keep keys out of the image.
 
 High-level HTTP servers parse headers into mappings or normalized field objects, which can lose ordering, duplicate
 fields, original casing, whitespace, and wire line endings. Reading the request head directly with
